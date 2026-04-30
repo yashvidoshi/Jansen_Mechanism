@@ -7,8 +7,6 @@ else
 end
 
 %% 1. Parameters
-% Nominal dimensions from the validation paper appendix, with the paper's
-% example adjustable values substituted for L1, L4, and L8.
 % Appendix nominal set: [11,45,36,34,48.5,41.5,60.5,41.5,42,43,26.5,54.5].
 L = struct();
 L.names = ["L1","L2","L3","L4","L5","L6","L7","L8","L9","L10","L11","L12"];
@@ -110,18 +108,6 @@ disp("Done. The struct named 'result' contains trajectories, angles, spans, and 
 %% Local functions
 
 function out = simulateJansenCycle(L, N, omega, phaseOffset, qStart, frameRotation)
-%SIMULATEJANSENCYCLE Solve all closed loops for one crank revolution.
-%
-% Link vector directions used in this code:
-%   L1:  P0 -> P1       L2:  P1 -> P2       L3:  P3 -> P2
-%   L4:  P0 -> P3       L5:  P2 -> P4       L6:  P3 -> P4
-%   L7:  P1 -> P5       L8:  P3 -> P5       L9:  P5 -> P6
-%   L10: P4 -> P6       L11: P5 -> PE       L12: PE -> P6
-%
-% Unknown vector:
-%   q = [theta2 theta3 theta5 theta6 theta7 theta8 theta9 theta10 theta11 theta12]
-% theta1 is the prescribed input crank angle; theta4 = 0 is the ground angle.
-
     if nargin < 6
         frameRotation = 0;
     end
