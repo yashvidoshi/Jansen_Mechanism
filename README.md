@@ -23,8 +23,8 @@ This project models the kinematics of the famous Theo Jansen leg mechanism, gene
 ## 1. Foot Tip Trajectory
 
 Shows the closed-loop trajectory traced by the foot during one crank revolution.
+<img width="1523" height="362" alt="foot_trajectory" src="https://github.com/user-attachments/assets/dcf0d062-5115-4e6c-9aff-fccb688c2b39" />
 
-![Foot Trajectory](foot_trajectory.png)
 
 ---
 
@@ -32,7 +32,8 @@ Shows the closed-loop trajectory traced by the foot during one crank revolution.
 
 Compares the generated walking trajectory against an ideal gait curve.
 
-![Gait Comparison](gait_comparison.png)
+<img width="1382" height="332" alt="gait_comparison" src="https://github.com/user-attachments/assets/3f6bb000-2a14-4aa7-aabd-751adf3d1130" />
+
 
 ---
 
@@ -40,15 +41,15 @@ Compares the generated walking trajectory against an ideal gait curve.
 
 Illustrates how changing the long connector length affects the gait trajectory.
 
-![Variation h](link_variation_h.png)
-
+<img width="1524" height="404" alt="link_variation_h" src="https://github.com/user-attachments/assets/29d88b19-c70f-4dfd-a7e5-c5a846224fec" />
 ---
 
 ## 4. Effect of Varying Link `m`
 
 Illustrates how changing crank length modifies stride and step height.
 
-![Variation m](link_variation_m.png)
+<img width="1524" height="465" alt="link_variation_m" src="https://github.com/user-attachments/assets/cb1fcc7a-aa7d-4091-85c4-36f63d1083fc" />
+
 
 ---
 
@@ -56,7 +57,8 @@ Illustrates how changing crank length modifies stride and step height.
 
 Animated simulation of the Theo Jansen mechanism.
 
-![Animation](mechanism_animation.gif)
+<img width="800" height="800" alt="mechanism_animation-2" src="https://github.com/user-attachments/assets/096a0cb1-c239-4aed-81f1-a0b6849202e9" />
+
 
 ---
 
@@ -188,18 +190,6 @@ The parameter sweep also demonstrates how small geometric changes significantly 
 
 ---
 
-# Educational Applications
-
-This project can be used for:
-
-- Robotics courses
-- Mechanism design
-- Linkage kinematics
-- Bio-inspired locomotion
-- Gait analysis
-- Simulation projects
-
----
 
 # Reference
 
@@ -210,10 +200,4 @@ This project can be used for:
 
 ---
 
-# Author
 
-Yashvi Doshi
-
-IE410 — Introduction to Robotics Project
-
----
