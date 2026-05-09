@@ -1,934 +1,502 @@
-clear; close all; clc;
-
-if exist("fsolve", "file") == 2
-    fprintf("Solver: MATLAB fsolve from Optimization Toolbox.\n");
-else
-    fprintf("Solver: included damped Newton solver because fsolve is unavailable.\n");
-end
-
-%% 1. Parameters
-% Appendix nominal set: [11,45,36,34,48.5,41.5,60.5,41.5,42,43,26.5,54.5].
-L = struct();
-L.names = ["L1","L2","L3","L4","L5","L6","L7","L8","L9","L10","L11","L12"];
-L.val = [11.29, 45.0, 36.0, 32.93, 48.5, 41.5, 60.5, 41.78, 42.0, 43.0, 26.5, 54.5].';
-
-sim = struct();
-sim.N = 361;                    % one full crank turn
-sim.omega = 2*pi/2.0;           % rad/s; 2 s per gait cycle
-sim.phaseOffset = 0.0;          % radians; changes starting point only
-sim.gaitFrameRotationDeg = -11.4; % rotates mechanism frame to gait/world frame
-sim.showPaperFigure4 = true;
-sim.showNinePatternValidation = true;
-sim.runAnimation = true;
-sim.animationFrameStep = 3;      % higher value makes animation faster
-sim.showDiagnosticPlots = false; % set true for separate trajectory/velocity/residual figures
-sim.showMechanismFrames = false;
-sim.NAdvanced = 91;             % lower resolution for sensitivity sweeps
-sim.runSensitivity = false;      % set true for adjustable-link sensitivity plots
-sim.runLeastSquaresDemo = false; % set true for span-to-link least-squares demo
-
-fprintf("Modified Jansen gait trainer simulation\n");
-fprintf("Using adjustable values: L1 = %.2f cm, L4 = %.2f cm, L8 = %.2f cm\n", ...
-    L.val(1), L.val(4), L.val(8));
-
-%% 2. Main one-cycle simulation
-main = simulateJansenCycle(L.val, sim.N, sim.omega, sim.phaseOffset, [], ...
-    sim.gaitFrameRotationDeg*pi/180);
-
-spanX = spanOf(main.PE(1,:));
-spanY = spanOf(main.PE(2,:));
-areaPE = abs(polyarea(main.PE(1,:), main.PE(2,:)));
-fprintf("End-effector x-span = %.2f cm\n", spanX);
-fprintf("End-effector y-span = %.2f cm\n", spanY);
-fprintf("Closed-loop area     = %.2f cm^2\n", areaPE);
-fprintf("Max loop residual    = %.3e cm\n\n", max(main.resnorm));
-
-%% 3. Paper-style reference curve for visual comparison
-% The actual human marker data used in the papers is not inside the PDFs.
-% This pchip curve recreates the reported gait envelope:
-% desired span [xspan, yspan] = [50.02, 12.81] cm.
-targetSpan = [50.02; 12.81];
-ref = makeReferenceGait(main.gaitCycle, targetSpan);
-refAligned = alignCurveToSimulation(ref, main.PE);
-
-%% 4. Paper-style outputs
-if sim.showPaperFigure4
-    plotPaperStyleFigure4(main, refAligned, L);
-end
-
-if sim.showNinePatternValidation
-    validation = plotNinePatternValidation(L.val, sim);
-end
-
-if sim.runAnimation
-    animateJansenMechanism(main, L, sim.animationFrameStep);
-end
-
-%% 5. Optional diagnostic plots
-if sim.showDiagnosticPlots
-    plotEndEffector(main, refAligned, targetSpan, L);
-    plotGaitCurves(main, refAligned);
-    plotVelocityCurves(main);
-    plotConstraintResiduals(main);
-end
-
-if sim.showMechanismFrames
-    plotMechanismSnapshots(main, L);
-end
-
-%% 6. Optional advanced plots: sensitivity and least-squares link-span mapping
-if sim.runSensitivity
-    sensitivity = runAdjustableLinkSensitivity(L.val, sim);
-    plotSensitivity(sensitivity);
-end
-
-if sim.runLeastSquaresDemo
-    lsDemo = runLeastSquaresSpanMap(L.val, sim, targetSpan);
-    plotLeastSquaresDemo(lsDemo, targetSpan);
-end
-
-%% 7. Data exported to the MATLAB workspace
-result = struct();
-result.lengths_cm = L;
-result.main = main;
-result.reference = refAligned;
-result.targetSpan_cm = targetSpan;
-if exist("validation", "var")
-    result.validation = validation;
-end
-if exist("sensitivity", "var")
-    result.sensitivity = sensitivity;
-end
-if exist("lsDemo", "var")
-    result.leastSquaresDemo = lsDemo;
-end
-
-disp("Done. The struct named 'result' contains trajectories, angles, spans, and residuals.");
-
-%% Local functions
-
-function out = simulateJansenCycle(L, N, omega, phaseOffset, qStart, frameRotation)
-    if nargin < 6
-        frameRotation = 0;
-    end
-
-    crank = linspace(0, 2*pi, N);
-    t = crank / omega;
-    gaitCycle = 100 * crank / (2*pi);
-
-    solver = makeLoopSolver();
-
-    theta = nan(12, N);
-    qHist = nan(10, N);
-    exitflag = nan(1, N);
-    resnorm = nan(1, N);
-
-    P0 = nan(2, N); P1 = P0; P2 = P0; P3 = P0; P4 = P0;
-    P5 = P0; P6 = P0; PE = P0;
-
-    q = qStart;
-    for k = 1:N
-        theta1 = crank(k) + phaseOffset;
-
-        if isempty(q) || any(~isfinite(q))
-            q = geometricInitialGuess(L, theta1);
-        end
-
-        loopFun = @(qq) loopEquations(qq, theta1, L);
-        loopJac = @(qq) loopJacobian(qq, L);
-        [qCandidate, fval, flag] = solveLoopAngles(loopFun, loopJac, q, solver);
-        if flag <= 0 || norm(fval) > 1e-6
-            qGeom = geometricInitialGuess(L, theta1);
-            [qCandidate2, fval2, flag2] = solveLoopAngles(loopFun, loopJac, qGeom, solver);
-            if norm(fval2) < norm(fval)
-                qCandidate = qCandidate2;
-                fval = fval2;
-                flag = flag2;
-            end
-        end
-
-        q = unwrapNear(qCandidate(:), q(:));
-        qHist(:,k) = q;
-        exitflag(k) = flag;
-        resnorm(k) = norm(fval);
-
-        th = nan(12,1);
-        th(1) = theta1;
-        th(2) = q(1);
-        th(3) = q(2);
-        th(4) = 0;
-        th(5) = q(3);
-        th(6) = q(4);
-        th(7) = q(5);
-        th(8) = q(6);
-        th(9) = q(7);
-        th(10) = q(8);
-        th(11) = q(9);
-        th(12) = q(10);
-        theta(:,k) = th;
-
-        pos = positionsFromAngles(L, th);
-        P0(:,k) = pos.P0; P1(:,k) = pos.P1; P2(:,k) = pos.P2;
-        P3(:,k) = pos.P3; P4(:,k) = pos.P4; P5(:,k) = pos.P5;
-        P6(:,k) = pos.P6; PE(:,k) = pos.PE;
-    end
-
-    raw = struct("P0", P0, "P1", P1, "P2", P2, "P3", P3, "P4", P4, ...
-        "P5", P5, "P6", P6, "PE", PE);
-
-    if abs(frameRotation) > 0
-        R = [cos(frameRotation), -sin(frameRotation); ...
-             sin(frameRotation),  cos(frameRotation)];
-        P0 = R*P0; P1 = R*P1; P2 = R*P2; P3 = R*P3; P4 = R*P4;
-        P5 = R*P5; P6 = R*P6; PE = R*PE;
-    end
-
-    vx = gradient(PE(1,:), t);
-    vy = gradient(PE(2,:), t);
-    speed = hypot(vx, vy);
-
-    out = struct();
-    out.t = t;
-    out.crank = crank;
-    out.gaitCycle = gaitCycle;
-    out.theta = theta;
-    out.qHist = qHist;
-    out.exitflag = exitflag;
-    out.resnorm = resnorm;
-    out.P0 = P0; out.P1 = P1; out.P2 = P2; out.P3 = P3; out.P4 = P4;
-    out.P5 = P5; out.P6 = P6; out.PE = PE;
-    out.rawMechanismFrame = raw;
-    out.frameRotation_rad = frameRotation;
-    out.vx = vx; out.vy = vy; out.speed = speed;
-    out.span = [spanOf(PE(1,:)); spanOf(PE(2,:))];
-    out.area = abs(polyarea(PE(1,:), PE(2,:)));
-end
-
-function F = loopEquations(q, theta1, L)
-%LOOPEQUATIONS Five vector-loop closures, two scalar equations each.
-    u = @(a) [cos(a); sin(a)];
-
-    theta2 = q(1); theta3 = q(2); theta5 = q(3); theta6 = q(4);
-    theta7 = q(5); theta8 = q(6); theta9 = q(7); theta10 = q(8);
-    theta11 = q(9); theta12 = q(10);
-
-    e1 = u(theta1);  e2 = u(theta2);  e3 = u(theta3);  e4 = [1;0];
-    e5 = u(theta5);  e6 = u(theta6);  e7 = u(theta7);  e8 = u(theta8);
-    e9 = u(theta9);  e10 = u(theta10); e11 = u(theta11); e12 = u(theta12);
-
-    Fupper = L(1)*e1 + L(2)*e2 - L(3)*e3 - L(4)*e4;
-    Flower = L(1)*e1 + L(7)*e7 - L(8)*e8 - L(4)*e4;
-    Ftriangle = L(3)*e3 + L(5)*e5 - L(6)*e6;
-    Fpara = L(8)*e8 + L(9)*e9 - L(6)*e6 - L(10)*e10;
-    Ffoot = L(11)*e11 + L(12)*e12 - L(9)*e9;
-
-    F = [Fupper; Flower; Ftriangle; Fpara; Ffoot];
-end
-
-function J = loopJacobian(q, L)
-%LOOPJACOBIAN Analytic Jacobian dF/dq for the five vector-loop equations.
-    d = @(a) [-sin(a); cos(a)];
-
-    theta2 = q(1); theta3 = q(2); theta5 = q(3); theta6 = q(4);
-    theta7 = q(5); theta8 = q(6); theta9 = q(7); theta10 = q(8);
-    theta11 = q(9); theta12 = q(10);
-
-    J = zeros(10,10);
-
-    % Upper loop: L1*e1 + L2*e2 - L3*e3 - L4*e4 = 0.
-    J(1:2,1) =  L(2)*d(theta2);
-    J(1:2,2) = -L(3)*d(theta3);
-
-    % Lower loop: L1*e1 + L7*e7 - L8*e8 - L4*e4 = 0.
-    J(3:4,5) =  L(7)*d(theta7);
-    J(3:4,6) = -L(8)*d(theta8);
-
-    % Coupler triangle: L3*e3 + L5*e5 - L6*e6 = 0.
-    J(5:6,2) =  L(3)*d(theta3);
-    J(5:6,3) =  L(5)*d(theta5);
-    J(5:6,4) = -L(6)*d(theta6);
-
-    % Parallelogram-like loop: L8*e8 + L9*e9 - L6*e6 - L10*e10 = 0.
-    J(7:8,4) = -L(6)*d(theta6);
-    J(7:8,6) =  L(8)*d(theta8);
-    J(7:8,7) =  L(9)*d(theta9);
-    J(7:8,8) = -L(10)*d(theta10);
-
-    % Foot triangle: L11*e11 + L12*e12 - L9*e9 = 0.
-    J(9:10,7) = -L(9)*d(theta9);
-    J(9:10,9) =  L(11)*d(theta11);
-    J(9:10,10) = L(12)*d(theta12);
-end
-
-function solver = makeLoopSolver()
-%MAKELOOPSOLVER Use fsolve when available; otherwise use a built-in solver.
-    solver = struct();
-    solver.useFsolve = exist("fsolve", "file") == 2;
-    solver.tolF = 1e-10;
-    solver.tolStep = 1e-11;
-    solver.maxIter = 80;
-    solver.maxLineSearch = 16;
-
-    if solver.useFsolve
-        solver.options = optimoptions("fsolve", ...
-            "Display", "off", ...
-            "FunctionTolerance", solver.tolF, ...
-            "StepTolerance", solver.tolStep, ...
-            "OptimalityTolerance", solver.tolF, ...
-            "MaxIterations", 120, ...
-            "MaxFunctionEvaluations", 1500);
-    else
-        solver.options = [];
-    end
-end
-
-function [x, F, exitflag] = solveLoopAngles(fun, jac, x0, solver)
-%SOLVELOOPANGLES Nonlinear solve wrapper.
-    if solver.useFsolve
-        [x, F, exitflag] = fsolve(fun, x0, solver.options);
-        return;
-    end
-
-    [x, F, exitflag] = dampedNewtonSolve(fun, jac, x0, solver);
-end
-
-function [x, F, exitflag] = dampedNewtonSolve(fun, jac, x0, solver)
-%DAMPEDNEWTONSOLVE Small square-system Newton solver for this linkage.
-% It is included so the script remains runnable without Optimization Toolbox.
-    x = x0(:);
-    F = fun(x);
-    nrm = norm(F);
-    exitflag = 0;
-
-    for iter = 1:solver.maxIter
-        if nrm < solver.tolF
-            exitflag = 1;
-            return;
-        end
-
-        J = jac(x);
-        step = -J \ F;
-        if any(~isfinite(step)) || norm(step) > 5
-            step = -pinv(J) * F;
-        end
-
-        alpha = 1.0;
-        accepted = false;
-        for ls = 1:solver.maxLineSearch
-            xt = x + alpha*step;
-            Ft = fun(xt);
-            nt = norm(Ft);
-            if nt < nrm || nt < solver.tolF
-                x = xt;
-                F = Ft;
-                nrm = nt;
-                accepted = true;
-                break;
-            end
-            alpha = 0.5*alpha;
-        end
-
-        if ~accepted
-            x = x + alpha*step;
-            F = fun(x);
-            nrm = norm(F);
-        end
-
-        if norm(alpha*step) < solver.tolStep*(1 + norm(x))
-            exitflag = double(nrm < 1e-7);
-            return;
-        end
-    end
-end
-
-function pos = positionsFromAngles(L, th)
-%POSITIONSFROMANGLES Forward kinematics from solved link orientations.
-    u = @(a) [cos(a); sin(a)];
-
-    P0 = [0;0];
-    P3 = [L(4);0];
-    P1 = P0 + L(1)*u(th(1));
-    P2 = P1 + L(2)*u(th(2));
-    P5 = P1 + L(7)*u(th(7));
-    P4 = P2 + L(5)*u(th(5));
-    P6 = P5 + L(9)*u(th(9));
-    PE = P5 + L(11)*u(th(11));
-
-    pos = struct("P0", P0, "P1", P1, "P2", P2, "P3", P3, ...
-        "P4", P4, "P5", P5, "P6", P6, "PE", PE);
-end
-
-function q = geometricInitialGuess(L, theta1)
-%GEOMETRICINITIALGUESS Build the physical assembly mode from circle intersections.
-% This is not the solver; it selects the same branch before fsolve refines
-% the vector-loop equations.
-    P0 = [0;0];
-    P3 = [L(4);0];
-    P1 = P0 + L(1)*[cos(theta1); sin(theta1)];
-
-    P2c = circleIntersections(P1, L(2), P3, L(3));
-    P2 = pickBy(P2c, "maxY");
-
-    P5c = circleIntersections(P1, L(7), P3, L(8));
-    P5 = pickBy(P5c, "minY");
-
-    P4c = circleIntersections(P2, L(5), P3, L(6));
-    P4 = pickBy(P4c, "maxX");
-
-    P6c = circleIntersections(P5, L(9), P4, L(10));
-    P6 = pickBy(P6c, "maxX");
-    if P6(2) > min(P4(2), P5(2))
-        P6 = pickBy(P6c, "minY");
-    end
-
-    PEc = circleIntersections(P5, L(11), P6, L(12));
-    PE = pickBy(PEc, "minY");
-
-    ang = @(a,b) atan2(b(2)-a(2), b(1)-a(1));
-    q = [
-        ang(P1, P2)
-        ang(P3, P2)
-        ang(P2, P4)
-        ang(P3, P4)
-        ang(P1, P5)
-        ang(P3, P5)
-        ang(P5, P6)
-        ang(P4, P6)
-        ang(P5, PE)
-        ang(PE, P6)
-    ];
-end
-
-function pts = circleIntersections(c1, r1, c2, r2)
-%CIRCLEINTERSECTIONS Return the two intersection points of two circles.
-    dvec = c2 - c1;
-    d = norm(dvec);
-    if d < eps
-        error("Coincident circle centers in initial guess.");
-    end
-    if d > r1 + r2 || d < abs(r1 - r2)
-        error("The selected link lengths cannot assemble at this crank angle.");
-    end
-
-    a = (r1^2 - r2^2 + d^2) / (2*d);
-    h2 = max(r1^2 - a^2, 0);
-    h = sqrt(h2);
-    ex = dvec / d;
-    ey = [-ex(2); ex(1)];
-    p = c1 + a*ex;
-    pts = [p + h*ey, p - h*ey];
-end
-
-function p = pickBy(pts, mode)
-%PICKBY Select one of two branch points by geometric criterion.
-    switch mode
-        case "maxY"
-            [~, idx] = max(pts(2,:));
-        case "minY"
-            [~, idx] = min(pts(2,:));
-        case "maxX"
-            [~, idx] = max(pts(1,:));
-        case "minX"
-            [~, idx] = min(pts(1,:));
-        otherwise
-            error("Unknown branch-selection mode.");
-    end
-    p = pts(:,idx);
-end
-
-function q = unwrapNear(qNew, qOld)
-%UNWRAPNEAR Keep periodic angle solutions close to the previous step.
-    if isempty(qOld) || any(~isfinite(qOld))
-        q = qNew;
-        return;
-    end
-    q = qNew + 2*pi*round((qOld - qNew)/(2*pi));
-end
-
-function ref = makeReferenceGait(gaitCycle, span)
-%MAKEREFERENCEGAIT Smooth gait-like reference with the paper-reported spans.
-% This is for visual validation only; it is not the unpublished human dataset.
-    s = gaitCycle(:).' / 100;
-    knot = [0.00 0.08 0.16 0.28 0.42 0.58 0.72 0.86 1.00];
-    xShape = [0.48 0.42 0.25 -0.15 -0.50 -0.35 -0.10 0.20 0.48];
-    yShape = [0.55 0.95 1.00 0.35 0.15 0.06 0.00 0.18 0.55];
-    x = pchip(knot, xShape, s);
-    y = pchip(knot, yShape, s);
-
-    x = span(1) * (x - min(x)) / spanOf(x);
-    y = span(2) * (y - min(y)) / spanOf(y);
-    x = x - mean(x);
-    y = y - min(y);
-
-    ref = [x; y];
-end
-
-function refAligned = alignCurveToSimulation(ref, PE)
-%ALIGNCURVETOSIMULATION Translate reference to same lower-left envelope.
-    refAligned = ref;
-    refAligned(1,:) = ref(1,:) - mean(ref(1,:)) + mean(PE(1,:));
-    refAligned(2,:) = ref(2,:) - min(ref(2,:)) + min(PE(2,:));
-end
-
-function plotPaperStyleFigure4(main, ref, L)
-%PLOTPAPERSTYLEFIGURE4 Match the composite mechanism/gait plot in the paper.
-    fig = figure("Name", "Paper-style Fig. 4: mechanism and gait curves", ...
-        "Color", "w", "Position", [80 80 1120 560]);
-
-    axMech = axes(fig, "Position", [0.06 0.16 0.53 0.76]);
-    axes(axMech);
-    k = 22;
-    drawPaperMechanism(main, k, L);
-    hold on;
-
-    markerIdx = 1:5:numel(main.gaitCycle);
-    plot(ref(1,markerIdx), ref(2,markerIdx), "k*", ...
-        "MarkerSize", 5.5, "LineWidth", 1.1);
-    plot(main.PE(1,markerIdx), main.PE(2,markerIdx), "g", ...
-        "MarkerSize", 4.0, "LineWidth", 1.1);
-    text(main.PE(1,end)+1.0, main.PE(2,end), "Endpoint", ...
-        "FontSize", 10, "VerticalAlignment", "middle");
-
-    lengthText = makeLengthListText(L.val);
-    xText = min([main.P0(1,:), main.PE(1,:)]) - 6;
-    yText = max([main.P2(2,:), main.P4(2,:)]) - 4;
-    text(xText, yText, lengthText, "FontSize", 9, "FontName", "Consolas", ...
-        "VerticalAlignment", "top", "Interpreter", "none");
-
-    axis equal;
-    axis off;
-    title("Parameterized 12-link modified Jansen mechanism", ...
-        "FontSize", 11, "FontWeight", "normal");
-
-    axX = axes(fig, "Position", [0.67 0.58 0.28 0.30]);
-    predX = main.PE(1,:) - mean(main.PE(1,:));
-    refX = ref(1,:) - mean(ref(1,:));
-    plot(main.gaitCycle, refX, "m--", "LineWidth", 1.5); hold on;
-    plot(main.gaitCycle, predX, "k-", "LineWidth", 1.8);
-    grid on;
-    xlim([0 100]);
-    ylim([-40 40]);
-    ylabel("x-axis (cm)");
-    set(gca, "FontSize", 9);
-
-    axY = axes(fig, "Position", [0.67 0.20 0.28 0.30]);
-    predY = main.PE(2,:) - min(main.PE(2,:));
-    refY = ref(2,:) - min(ref(2,:));
-    plot(main.gaitCycle, refY, "b--", "LineWidth", 1.5); hold on;
-    plot(main.gaitCycle, predY, "r-", "LineWidth", 1.8);
-    grid on;
-    xlim([0 100]);
-    ylim([0 15]);
-    xlabel("Gait Cycle (%)");
-    ylabel("y-axis (cm)");
-    legend("meta-trajectory", "predicted trajectory", ...
-        "Location", "northeast", "FontSize", 8);
-    set(gca, "FontSize", 9);
-
-    caption = sprintf(['Fig. 4  Optimized to the gait envelope, the structure produces an endpoint trajectory with ' ...
-        'x-span %.2f cm and y-span %.2f cm. Crosses denote the reference envelope; circles/solid curves denote the ' ...
-        'simulated mechanism trajectory under constant crank speed.'], main.span(1), main.span(2));
-    annotation(fig, "textbox", [0.08 0.015 0.86 0.10], ...
-        "String", caption, ...
-        "EdgeColor", "none", "FontSize", 10, "FontWeight", "bold");
-
-    axes(axMech);
-end
-
-function drawPaperMechanism(main, k, L)
-%DRAWPAPERMECHANISM Draw one pose with labels similar to the paper figure.
-    linePairs = {
-        "P0","P1","L_1"; "P1","P2","L_2"; "P3","P2","L_3"; "P0","P3","L_4";
-        "P2","P4","L_5"; "P3","P4","L_6"; "P1","P5","L_7"; "P3","P5","L_8";
-        "P5","P6","L_9"; "P4","P6","L_{10}"; "P5","PE","L_{11}"; "PE","P6","L_{12}"};
-
-    for i = 1:size(linePairs,1)
-        A = main.(linePairs{i,1})(:,k);
-        B = main.(linePairs{i,2})(:,k);
-        plot([A(1), B(1)], [A(2), B(2)], "-", "LineWidth", 1.5);
-        hold on;
-        mid = 0.52*A + 0.48*B;
-        text(mid(1), mid(2), linePairs{i,3}, ...
-            "FontSize", 11, "FontWeight", "bold", "Interpreter", "tex");
-    end
-
-    pointNames = ["P0","P1","P2","P3","P4","P5","P6","PE"];
-    P = zeros(2, numel(pointNames));
-    for i = 1:numel(pointNames)
-        P(:,i) = main.(pointNames(i))(:,k);
-    end
-    plot(P(1,:), P(2,:), "ks", "MarkerFaceColor", "y", "MarkerSize", 6);
-
-    xMargin = 8;
-    yMargin = 8;
-    xlim([min([P(1,:), main.PE(1,:)])-xMargin, max([P(1,:), main.PE(1,:)])+xMargin]);
-    ylim([min([P(2,:), main.PE(2,:)])-yMargin, max([P(2,:), main.PE(2,:)])+yMargin]);
-
-    % Put link labels a little away from the length-list text.
-    unused = L; %#ok<NASGU>
-end
-
-function txt = makeLengthListText(L)
-%MAKELENGTHLISTTEXT Link length annotation used in the paper-style figure.
-    lines = strings(14,1);
-    lines(1) = "Unit: cm";
-    for i = 1:12
-        lines(i+1) = sprintf("L%-2d = %4.1f", i, L(i));
-    end
-    txt = strjoin(lines, newline);
-end
-
-function validation = plotNinePatternValidation(Lnom, sim)
-%PLOTNINEPATTERNVALIDATION Create a 3x3 paper-style RMSE validation grid.
-% The PDFs do not contain the original 113-subject ankle database. This grid
-% uses nine gait-envelope variants and solves the actual mechanism for each.
-    xSpanGrid = [56 53 50; 53 50 47; 50 47 44];
-    ySpanGrid = [14.2 13.6 13.0; 13.6 13.0 12.4; 13.0 12.4 11.8];
-    L1Grid = Lnom(1) + [0.45 0.25 0.05; 0.25 0.00 -0.20; 0.05 -0.20 -0.45];
-    L4Grid = Lnom(4) + [-0.90 -0.50 -0.10; -0.50 0.00 0.50; -0.10 0.50 0.90];
-    L8Grid = Lnom(8) + [0.90 0.50 0.10; 0.50 0.00 -0.50; 0.10 -0.50 -0.90];
-
-    fig = figure("Name", "Paper-style 3x3 validation grid", ...
-        "Color", "w", "Position", [120 90 1040 620]);
-    tl = tiledlayout(3,3, "Padding", "compact", "TileSpacing", "compact");
-
-    validation = struct();
-    validation.patterns = repmat(struct("L", [], "reference", [], ...
-        "simulation", [], "rmse", [], "span", []), 3, 3);
-
-    for row = 1:3
-        for col = 1:3
-            L = Lnom;
-            L(1) = L1Grid(row,col);
-            L(4) = L4Grid(row,col);
-            L(8) = L8Grid(row,col);
-            out = simulateJansenCycle(L, sim.NAdvanced, sim.omega, sim.phaseOffset, [], ...
-                sim.gaitFrameRotationDeg*pi/180);
-
-            ref = makeReferenceGait(out.gaitCycle, [xSpanGrid(row,col); ySpanGrid(row,col)]);
-            ref = alignCurveToSimulation(ref, out.PE);
-
-            [simPanel, refPanel] = panelNormalizeCurves(out.PE, ref);
-            rmse = sqrt(mean(sum((simPanel - refPanel).^2, 1)));
-
-            ax = nexttile;
-            markerIdx = 1:2:numel(out.gaitCycle);
-            plot(refPanel(1,markerIdx), refPanel(2,markerIdx), "k+", ...
-                "MarkerSize", 5.0, "LineWidth", 1.0); hold on;
-            plot(simPanel(1,markerIdx), simPanel(2,markerIdx), "gs", ...
-                "MarkerSize", 4.0, "LineWidth", 1.0);
-            grid on;
-            xlim([0 70]);
-            ylim([0 20]);
-            text(5, 17, sprintf("RMSE=%.2f", rmse), ...
-                "FontSize", 11, "FontWeight", "normal");
-            set(ax, "FontSize", 8);
-
-            if row < 3
-                set(ax, "XTickLabel", []);
-            else
-                xlabel("x- axis (cm)");
-            end
-            if col > 1
-                set(ax, "YTickLabel", []);
-            else
-                ylabel("y- axis (cm)");
-            end
-            if row == 1 && col == 1
-                legend("reference", "simulation", "Location", "northwest", "FontSize", 7);
-            end
-
-            validation.patterns(row,col).L = L;
-            validation.patterns(row,col).reference = refPanel;
-            validation.patterns(row,col).simulation = simPanel;
-            validation.patterns(row,col).rmse = rmse;
-            validation.patterns(row,col).span = out.span;
-        end
-    end
-
-    title(tl, "Reference-vs-simulation endpoint trajectories for nine gait envelopes", ...
-        "FontSize", 12, "FontWeight", "bold");
-end
-
-function [simPanel, refPanel] = panelNormalizeCurves(simCurve, refCurve)
-%PANELNORMALIZECURVES Translate curves to a common 0-to-70 cm plotting frame.
-    simPanel = simCurve;
-    refPanel = refCurve;
-
-    xmin = min([simPanel(1,:), refPanel(1,:)]);
-    ymin = min([simPanel(2,:), refPanel(2,:)]);
-
-    simPanel(1,:) = simPanel(1,:) - xmin + 8;
-    refPanel(1,:) = refPanel(1,:) - xmin + 8;
-    simPanel(2,:) = simPanel(2,:) - ymin + 1.5;
-    refPanel(2,:) = refPanel(2,:) - ymin + 1.5;
-end
-
-function animateJansenMechanism(main, L, frameStep)
-%ANIMATEJANSENMECHANISM Visible one-cycle mechanism simulation.
-    if nargin < 3
-        frameStep = 3;
-    end
-
-    if ~usejava("desktop")
-        disp("Live animation skipped because MATLAB is running without the desktop UI.");
-        return;
-    end
-
-    fig = figure("Name", "Running simulation: modified Jansen mechanism", ...
-        "Color", "w", "Position", [160 120 900 560]);
-    ax = axes("Parent", fig);
-
-    allX = [main.P0(1,:), main.P1(1,:), main.P2(1,:), main.P3(1,:), main.P4(1,:), ...
-        main.P5(1,:), main.P6(1,:), main.PE(1,:)];
-    allY = [main.P0(2,:), main.P1(2,:), main.P2(2,:), main.P3(2,:), main.P4(2,:), ...
-        main.P5(2,:), main.P6(2,:), main.PE(2,:)];
-    xLim = [min(allX)-8, max(allX)+8];
-    yLim = [min(allY)-8, max(allY)+8];
-
-    for k = 1:frameStep:numel(main.gaitCycle)
-        if ~isvalid(fig)
-            break;
-        end
-        if ~isvalid(ax)
-            ax = axes("Parent", fig);
-        end
-        cla(ax);
-        axes(ax); %#ok<LAXES>
-        drawMechanism(main, k, [0 0.2 0.85]);
-        hold on;
-        plot(main.PE(1,1:k), main.PE(2,1:k), "g-", "LineWidth", 2.2);
-        plot(main.PE(1,k), main.PE(2,k), "bd", "MarkerFaceColor", "r", "MarkerSize", 7);
-        grid on; axis equal;
-        xlim(xLim); ylim(yLim);
-        xlabel("x position (cm)");
-        ylabel("y position (cm)");
-        title(sprintf("Running one-DOF simulation, crank angle = %.1f deg", ...
-            main.crank(k)*180/pi));
-        text(xLim(1)+2, yLim(2)-4, ...
-            sprintf("L1=%.2f cm, L4=%.2f cm, L8=%.2f cm", L.val(1), L.val(4), L.val(8)), ...
-            "BackgroundColor", "w", "Margin", 4);
-        drawnow;
-        pause(0.005);
-    end
-end
-
-function plotEndEffector(main, ref, targetSpan, L)
-    figure("Name", "End-effector gait trajectory", "Color", "w");
-    plot(main.PE(1,:), main.PE(2,:), "k-", "LineWidth", 2.4); hold on;
-    plot(ref(1,:), ref(2,:), "b", "LineWidth", 1.7);
-    plot(main.PE(1,1), main.PE(2,1), "ko", "MarkerFaceColor", "k", "MarkerSize", 5);
-    grid on; axis equal;
-    xlabel("x position (cm)");
-    ylabel("y position (cm)");
-    title("Modified Jansen end-effector / ankle trajectory");
-    legend("simulated mechanism", ...
-        sprintf("gait-like reference %.2f x %.2f cm", targetSpan(1), targetSpan(2)), ...
-        "start", "Location", "best");
-
-    text(min(main.PE(1,:)), max(main.PE(2,:)), ...
-        sprintf("L1=%.2f, L4=%.2f, L8=%.2f cm", L.val(1), L.val(4), L.val(8)), ...
-        "VerticalAlignment", "top", "BackgroundColor", "w", "Margin", 4);
-end
-
-function plotGaitCurves(main, ref)
-    figure("Name", "Gait-cycle position curves", "Color", "w");
-    tiledlayout(2,1, "Padding", "compact", "TileSpacing", "compact");
-
-    nexttile;
-    plot(main.gaitCycle, main.PE(1,:), "r-", "LineWidth", 2.2); hold on;
-    plot(main.gaitCycle, ref(1,:), "b--", "LineWidth", 1.5);
-    grid on;
-    ylabel("x (cm)");
-    title("Horizontal ankle motion over gait cycle");
-    legend("simulated", "reference envelope", "Location", "best");
-
-    nexttile;
-    plot(main.gaitCycle, main.PE(2,:), "c:", "LineWidth", 2.2); hold on;
-    plot(main.gaitCycle, ref(2,:), "r--", "LineWidth", 1.5);
-    grid on;
-    xlabel("gait cycle (%)");
-    ylabel("y (cm)");
-    title("Vertical ankle motion over gait cycle");
-end
-
-function plotVelocityCurves(main)
-    figure("Name", "End-effector velocity curves", "Color", "w");
-    tiledlayout(3,1, "Padding", "compact", "TileSpacing", "compact");
-
-    nexttile;
-    plot(main.gaitCycle, main.vx, "LineWidth", 1.8);
-    grid on; ylabel("vx (cm/s)");
-    title("End-effector velocity with constant crank speed");
-
-    nexttile;
-    plot(main.gaitCycle, main.vy, "LineWidth", 1.8);
-    grid on; ylabel("vy (cm/s)");
-
-    nexttile;
-    plot(main.gaitCycle, main.speed, "LineWidth", 1.8);
-    grid on; xlabel("gait cycle (%)"); ylabel("|v| (cm/s)");
-end
-
-function plotConstraintResiduals(main)
-    figure("Name", "Closed-loop validation", "Color", "w");
-    semilogy(main.gaitCycle, main.resnorm + eps, "k-", "LineWidth", 1.8);
-    grid on;
-    xlabel("gait cycle (%)");
-    ylabel("||loop residual||_2 (cm)");
-    title("Vector-loop closure residual from fsolve");
-end
-
-function plotMechanismSnapshots(main, L)
-    figure("Name", "Mechanism snapshots", "Color", "w");
-    idx = round(linspace(1, numel(main.gaitCycle)-1, 7));
-    for k = idx
-        drawMechanism(main, k, [0.65 0.65 0.65]);
-        hold on;
-    end
-    drawMechanism(main, idx(2), [0 0.2 0.8]);
-    plot(main.PE(1,:), main.PE(2,:), "m-", "LineWidth", 2.0);
-    grid on; axis equal;
-    xlabel("x (cm)"); ylabel("y (cm)");
-    title(sprintf("Assembly snapshots, L = [%.2f %.1f %.1f %.2f ...] cm", ...
-        L.val(1), L.val(2), L.val(3), L.val(4)));
-end
-
-function drawMechanism(main, k, color)
-    linePairs = {
-        "P0","P1"; "P1","P2"; "P3","P2"; "P0","P3";
-        "P1","P5"; "P3","P5"; "P2","P4"; "P3","P4";
-        "P5","P6"; "P4","P6"; "P5","PE"; "PE","P6"};
-
-    for i = 1:size(linePairs,1)
-        A = main.(linePairs{i,1})(:,k);
-        B = main.(linePairs{i,2})(:,k);
-        plot([A(1), B(1)], [A(2), B(2)], "-", "Color", color, "LineWidth", 2);
-        hold on;
-    end
-    pts = [main.P0(:,k), main.P1(:,k), main.P2(:,k), main.P3(:,k), ...
-        main.P4(:,k), main.P5(:,k), main.P6(:,k), main.PE(:,k)];
-    plot(pts(1,:), pts(2,:), "d", "Color", color, "MarkerFaceColor", color, "MarkerSize", 5);
-end
-
-function sensitivity = runAdjustableLinkSensitivity(Lnom, sim)
-%RUNADJUSTABLELINKSENSITIVITY Quantify effects of L1, L4, and L8.
-    adjustable = [1 4 8];
-    pct = linspace(-0.04, 0.04, 9);
-    spans = nan(numel(adjustable), numel(pct), 2);
-    areas = nan(numel(adjustable), numel(pct));
-
-    for i = 1:numel(adjustable)
-        for j = 1:numel(pct)
-            L = Lnom;
-            L(adjustable(i)) = Lnom(adjustable(i)) * (1 + pct(j));
-            out = simulateJansenCycle(L, sim.NAdvanced, sim.omega, sim.phaseOffset, [], ...
-                sim.gaitFrameRotationDeg*pi/180);
-            spans(i,j,:) = out.span;
-            areas(i,j) = out.area;
-        end
-    end
-
-    sensitivity = struct();
-    sensitivity.adjustable = adjustable;
-    sensitivity.percentChange = 100*pct;
-    sensitivity.spans = spans;
-    sensitivity.areas = areas;
-end
-
-function plotSensitivity(sensitivity)
-    figure("Name", "Adjustable-link sensitivity", "Color", "w");
-    tiledlayout(1,2, "Padding", "compact", "TileSpacing", "compact");
-    names = ["L1", "L4", "L8"];
-
-    nexttile;
-    for i = 1:3
-        plot(sensitivity.percentChange, squeeze(sensitivity.spans(i,:,1)), ...
-            "o-", "LineWidth", 1.6); hold on;
-    end
-    grid on; xlabel("link length change (%)"); ylabel("x-span / stride (cm)");
-    title("Effect on horizontal span");
-    legend(names, "Location", "best");
-
-    nexttile;
-    for i = 1:3
-        plot(sensitivity.percentChange, squeeze(sensitivity.spans(i,:,2)), ...
-            "o-", "LineWidth", 1.6); hold on;
-    end
-    grid on; xlabel("link length change (%)"); ylabel("y-span / step height (cm)");
-    title("Effect on vertical span");
-    legend(names, "Location", "best");
-end
-
-function lsDemo = runLeastSquaresSpanMap(Lnom, sim, targetSpan)
-%RUNLEASTSQUARESSPANMAP Demonstrates Lambda = Psi*Sigma from the paper.
-% Lambda stores [L1; L4; L8] samples. Sigma stores [xspan; yspan] samples.
-    L1set = Lnom(1) + [-0.6 0 0.6];
-    L4set = Lnom(4) + [-1.0 0 1.0];
-    L8set = Lnom(8) + [-1.0 0 1.0];
-
-    n = numel(L1set) * numel(L4set) * numel(L8set);
-    Lambda = nan(3, n);
-    Sigma = nan(2, n);
-    samples = nan(n, 5);
-    c = 0;
-
-    for a = 1:numel(L1set)
-        for b = 1:numel(L4set)
-            for d = 1:numel(L8set)
-                c = c + 1;
-                L = Lnom;
-                L(1) = L1set(a);
-                L(4) = L4set(b);
-                L(8) = L8set(d);
-                out = simulateJansenCycle(L, sim.NAdvanced, sim.omega, sim.phaseOffset, [], ...
-                    sim.gaitFrameRotationDeg*pi/180);
-                Lambda(:,c) = [L(1); L(4); L(8)];
-                Sigma(:,c) = out.span;
-                samples(c,:) = [L(1), L(4), L(8), out.span(1), out.span(2)];
-            end
-        end
-    end
-
-    Psi = Lambda * pinv(Sigma);
-    LpredAdj = Psi * targetSpan;
-    Lpred = Lnom;
-    Lpred([1 4 8]) = LpredAdj;
-    predicted = simulateJansenCycle(Lpred, sim.N, sim.omega, sim.phaseOffset, [], ...
-        sim.gaitFrameRotationDeg*pi/180);
-
-    lsDemo = struct();
-    lsDemo.Lambda = Lambda;
-    lsDemo.Sigma = Sigma;
-    lsDemo.Psi = Psi;
-    lsDemo.samples = samples;
-    lsDemo.Lpred = Lpred;
-    lsDemo.predicted = predicted;
-end
-
-function plotLeastSquaresDemo(lsDemo, targetSpan)
-    figure("Name", "Least-squares span-to-link map", "Color", "w");
-    tiledlayout(1,2, "Padding", "compact", "TileSpacing", "compact");
-
-    nexttile;
-    scatter(lsDemo.Sigma(1,:), lsDemo.Sigma(2,:), 45, "k", "filled"); hold on;
-    plot(targetSpan(1), targetSpan(2), "rp", "MarkerSize", 14, "MarkerFaceColor", "r");
-    plot(lsDemo.predicted.span(1), lsDemo.predicted.span(2), "bo", "MarkerSize", 9, "LineWidth", 2);
-    grid on;
-    xlabel("x-span (cm)");
-    ylabel("y-span (cm)");
-    title("Sampled span cloud and requested span");
-    legend("simulation samples", "requested span", "span from predicted links", "Location", "best");
-
-    nexttile;
-    plot(lsDemo.predicted.PE(1,:), lsDemo.predicted.PE(2,:), "b-", "LineWidth", 2.2);
-    grid on; axis equal;
-    xlabel("x (cm)"); ylabel("y (cm)");
-    title(sprintf("LS predicted L1=%.2f, L4=%.2f, L8=%.2f cm", ...
-        lsDemo.Lpred(1), lsDemo.Lpred(4), lsDemo.Lpred(8)));
-end
-
-function s = spanOf(v)
-%SPANOF Max-min span without relying on toolbox-specific range behavior.
-    s = max(v(:)) - min(v(:));
-end
+"""
+theo_jansen_complete.py
+=======================
+Theo Jansen Walking Mechanism — Complete Simulation
+IE410: Introduction to Robotics — Project Part B
+
+All-in-one file combining:
+  1. Kinematics engine  (jansen_kinematics.py)
+  2. Main simulation    (sim_jansen.py)
+  3. Link variation     (link_variation.py)
+
+Produces five output files:
+  foot_trajectory.png      — closed shoe-sole foot trajectory
+  mechanism_animation.gif  — animated mechanism (dark background, new link colours)
+  gait_comparison.png      — simulated vs reference gait curve
+  link_variation_m.png     — effect of varying crank length m
+  link_variation_h.png     — effect of varying long connector h
+
+Link lengths: Theo Jansen's published "holy numbers" (2007).
+Reference: Shin et al. (2018), JMR; Jadav et al., Single-DOF Gait Trainer.
+
+Usage:
+    python theo_jansen_complete.py
+"""
+
+import os
+import copy
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib import cm
+import imageio.v2 as imageio
+
+OUT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — KINEMATICS ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Theo Jansen's "holy numbers" (unscaled, Jansen 2007)
+DEFAULT_LINKS = {
+    'a': 38.0,  'b': 41.5,  'c': 39.3,  'd': 40.1,
+    'e': 55.8,  'f': 39.4,  'g': 36.7,  'h': 65.7,
+    'i': 49.0,  'j': 50.0,  'k': 61.9,  'l': 7.8,
+    'm': 15.0,
+}
+
+# Scale factor so plots show convenient mm-like units
+SCALE = 5.4
+
+# ── NEW LINK COLOURS ───────────────────────────────────────────────────────────
+# Vivid palette chosen for contrast on dark (black) background.
+# Format: (start_joint, end_joint, hex_colour, label)
+LINK_EDGES = [
+    ('O',    'C',    '#FF4444', 'm  (crank)'),           # bright red
+    ('O',    'P',    '#AAAAAA', 'a–l (ground)'),          # light grey
+    ('C',    'B_up', '#FFD700', 'j  (upper coupler)'),    # gold
+    ('P',    'B_up', '#00CFFF', 'b  (upper rocker)'),     # sky blue
+    ('B_up', 'D_up', '#39FF14', 'c'),                     # neon green
+    ('P',    'D_up', '#BF5FFF', 'd'),                     # violet
+    ('C',    'B_lo', '#FF6EC7', 'e  (lower coupler)'),    # hot pink
+    ('P',    'B_lo', '#FF9900', 'f'),                     # orange
+    ('B_lo', 'D_lo', '#FF4444', 'g'),                     # bright red
+    ('D_up', 'D_lo', '#00CFFF', 'h  (long connector)'),   # sky blue
+    ('B_lo', 'F',    '#39FF14', 'i  (foot side)'),        # neon green
+    ('D_lo', 'F',    '#FFD700', 'k  (foot side)'),        # gold
+]
+
+# ── BACKGROUND / FOREGROUND COLOURS ──────────────────────────────────────────
+BG_COLOR   = '#0D0D0D'   # near-black background
+FG_COLOR   = '#E8E8E8'   # off-white text / axes
+GRID_COLOR = '#2A2A2A'   # subtle dark grid
+FOOT_COLOR = '#FF00FF'   # magenta foot trace (matches original video)
+
+
+def _apply_dark_style(ax, fig):
+    """Apply dark background to a figure and axes."""
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(FG_COLOR)
+    ax.tick_params(colors=FG_COLOR, which='both')
+    ax.xaxis.label.set_color(FG_COLOR)
+    ax.yaxis.label.set_color(FG_COLOR)
+    ax.title.set_color(FG_COLOR)
+    ax.grid(True, color=GRID_COLOR, alpha=0.6, linewidth=0.8)
+
+
+# ── CIRCLE–CIRCLE INTERSECTION ────────────────────────────────────────────────
+def cci(c1, r1, c2, r2, branch='+'):
+    """
+    Return one intersection point of two circles.
+
+    branch='+' → left  of directed vector c1→c2
+    branch='-' → right of directed vector c1→c2
+    Returns None if circles do not intersect.
+    """
+    c1 = np.asarray(c1, dtype=float)
+    c2 = np.asarray(c2, dtype=float)
+    d_vec = c2 - c1
+    d = np.linalg.norm(d_vec)
+    if d == 0.0 or d > r1 + r2 or d < abs(r1 - r2):
+        return None
+    p = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d)
+    h_sq = r1 * r1 - p * p
+    if h_sq < 0.0:
+        return None
+    h = np.sqrt(max(h_sq, 0.0))
+    midpoint = c1 + p * d_vec / d
+    perp = np.array([-d_vec[1] / d, d_vec[0] / d])
+    return midpoint + h * perp if branch == '+' else midpoint - h * perp
+
+
+# ── FORWARD KINEMATICS ────────────────────────────────────────────────────────
+def solve_pose(theta, links=None, scale=None):
+    """
+    Solve full mechanism pose for crank angle theta (radians).
+    Returns dict of joint positions, or None if assembly fails.
+    """
+    L = DEFAULT_LINKS if links is None else links
+    s = SCALE        if scale  is None else scale
+
+    a  = L['a'] * s;  b  = L['b'] * s;  c  = L['c'] * s
+    d_ = L['d'] * s;  e  = L['e'] * s;  f  = L['f'] * s
+    g  = L['g'] * s;  h_ = L['h'] * s;  i_ = L['i'] * s
+    j  = L['j'] * s;  k  = L['k'] * s
+    l  = L['l'] * s;  m  = L['m'] * s
+
+    O = np.array([0.0,  0.0])
+    P = np.array([-a,  -l])
+
+    # Crank tip — mirrored so leg extends left
+    C = O + m * np.array([-np.cos(theta), np.sin(theta)])
+
+    B_up = cci(C, j, P, b, branch='-');   
+    if B_up is None: return None
+
+    D_up = cci(B_up, c, P, d_, branch='-')
+    if D_up is None: return None
+
+    B_lo = cci(C, e, P, f, branch='+')
+    if B_lo is None: return None
+
+    D_lo = cci(B_lo, g, D_up, h_, branch='+')
+    if D_lo is None: return None
+
+    F = cci(B_lo, i_, D_lo, k, branch='+')
+    if F is None: return None
+
+    return {'O': O, 'P': P, 'C': C,
+            'B_up': B_up, 'D_up': D_up,
+            'B_lo': B_lo, 'D_lo': D_lo,
+            'F': F}
+
+
+# ── SIMULATE ONE CYCLE ────────────────────────────────────────────────────────
+def simulate_cycle(n_samples=360, links=None, scale=None,
+                   theta_start=0.0, theta_end=2 * np.pi):
+    """
+    Simulate one full crank revolution.
+    Returns (thetas, foot_array, poses_list).
+    """
+    thetas = np.linspace(theta_start, theta_end, n_samples)
+    foot   = np.full((n_samples, 2), np.nan)
+    poses  = []
+    for i, th in enumerate(thetas):
+        pose = solve_pose(th, links, scale)
+        poses.append(pose)
+        if pose is not None:
+            foot[i] = pose['F']
+    return thetas, foot, poses
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — PLOTS & ANIMATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── PLOT 1: Foot Trajectory ───────────────────────────────────────────────────
+def plot_foot_trajectory(foot, save_path):
+    """Static plot of the closed foot-tip trajectory (dark background)."""
+    fig, ax = plt.subplots(figsize=(11, 5))
+    _apply_dark_style(ax, fig)
+
+    # Main magenta trace
+    ax.plot(foot[:, 0], foot[:, 1], color=FOOT_COLOR, lw=2.2,
+            label='Foot tip (F) trajectory', zorder=3)
+
+    # Highlight stance phase (lower half of trajectory)
+    y_med   = np.median(foot[:, 1])
+    stance  = foot[:, 1] < y_med
+    ax.plot(foot[stance, 0], foot[stance, 1],
+            color='#FF6600', lw=4.0, alpha=0.6,
+            label='Stance phase (ground contact)', zorder=2)
+
+    # Start marker
+    ax.plot(foot[0, 0], foot[0, 1], 'o',
+            color='#00FF88', ms=11, zorder=5,
+            label='Start (θ = 0°)')
+
+    ax.set_aspect('equal')
+    ax.set_xlabel('X (mm)', fontsize=12)
+    ax.set_ylabel('Y (mm)', fontsize=12)
+    ax.set_title('Theo Jansen — Foot Tip Trajectory  (one full crank revolution)',
+                 fontsize=13)
+
+    leg = ax.legend(loc='lower right', fontsize=10,
+                    facecolor='#1A1A1A', edgecolor=FG_COLOR,
+                    labelcolor=FG_COLOR)
+
+    stride = np.ptp(foot[:, 0])
+    height = np.ptp(foot[:, 1])
+    info = (f'Stride length : {stride:.1f} mm\n'
+            f'Step height   : {height:.1f} mm\n'
+            f'Stride / step : {stride / height:.2f}')
+    ax.text(0.02, 0.98, info, transform=ax.transAxes,
+            va='top', fontsize=11, color=FG_COLOR,
+            bbox=dict(boxstyle='round', facecolor='#1A1A2E', alpha=0.85,
+                      edgecolor='#444444'))
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=140, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  saved: {save_path}")
+
+
+# ── ANIMATION FRAME ───────────────────────────────────────────────────────────
+def render_frame(pose, foot_history, ax_lim, theta_deg):
+    """Render one animation frame — dark background, new link colours."""
+    fig, ax = plt.subplots(figsize=(8, 8))
+    _apply_dark_style(ax, fig)
+
+    # Built-up foot trace
+    if len(foot_history) > 1:
+        fh = np.array(foot_history)
+        ax.plot(fh[:, 0], fh[:, 1], '-', color=FOOT_COLOR,
+                lw=2.0, alpha=0.90, zorder=2)
+
+    # Draw every link with its assigned colour
+    for (a, b, colour, _lbl) in LINK_EDGES:
+        x = [pose[a][0], pose[b][0]]
+        y = [pose[a][1], pose[b][1]]
+        ax.plot(x, y, '-', color=colour, lw=5.5,
+                solid_capstyle='round', zorder=3)
+
+    # Joint markers
+    joint_names = ['O', 'P', 'C', 'B_up', 'D_up', 'B_lo', 'D_lo', 'F']
+    for name in joint_names:
+        pt = pose[name]
+        if name in ('O', 'P'):
+            ax.plot(pt[0], pt[1], 's', color='white', ms=9,
+                    markeredgecolor='#888888', zorder=5)
+        elif name == 'F':
+            ax.plot(pt[0], pt[1], 'o', color=FOOT_COLOR, ms=9,
+                    markeredgecolor='white', zorder=6)
+        else:
+            ax.plot(pt[0], pt[1], 'o', color='white', ms=5, zorder=4)
+
+    ax.set_xlim(ax_lim[0], ax_lim[1])
+    ax.set_ylim(ax_lim[2], ax_lim[3])
+    ax.set_aspect('equal')
+    ax.set_xlabel('X (mm)', fontsize=11)
+    ax.set_ylabel('Y (mm)', fontsize=11)
+    ax.set_title(f'Theo Jansen Mechanism  —  crank angle = {theta_deg:6.1f}°',
+                 fontsize=12)
+
+    fig.canvas.draw()
+    img = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+    plt.close(fig)
+    return img
+
+
+def make_animation(thetas, poses, foot, save_path, n_frames=90):
+    """Save animated GIF over one full crank cycle."""
+    valid_poses = [p for p in poses if p is not None]
+    if not valid_poses:
+        print("  No valid poses — skipping animation.")
+        return
+
+    # Compute axis limits from all joint positions
+    all_pts = np.vstack([list(p.values()) for p in valid_poses])
+    valid_foot = foot[~np.isnan(foot[:, 0])]
+    all_pts = np.vstack([all_pts, valid_foot])
+    pad  = 70
+    xlim = (all_pts[:, 0].min() - pad, all_pts[:, 0].max() + pad)
+    ylim = (all_pts[:, 1].min() - pad, all_pts[:, 1].max() + pad)
+    lim  = (xlim[0], xlim[1], ylim[0], ylim[1])
+
+    n    = len(poses)
+    step = max(1, n // n_frames)
+    frames, foot_history = [], []
+
+    for i in range(0, n, step):
+        if poses[i] is None:
+            continue
+        foot_history.append(foot[i])
+        frames.append(
+            render_frame(poses[i], foot_history,
+                         lim, np.degrees(thetas[i])))
+
+    imageio.mimsave(save_path, frames, duration=0.06, loop=0)
+    print(f"  saved: {save_path}  ({len(frames)} frames)")
+
+
+# ── PLOT 2: Gait Comparison ───────────────────────────────────────────────────
+def _reference_gait_curve(stride, height, n=200):
+    """Idealised shoe-sole reference curve at given stride/height."""
+    t   = np.linspace(0, 2 * np.pi, n)
+    rx  = (stride / 2.0) * np.cos(t)
+    ry  = np.maximum((height / 2.0) * np.sin(t), 0.05 * np.sin(2 * t))
+    return rx, ry
+
+
+def plot_gait_comparison(foot, save_path):
+    """Overlay simulated trajectory vs an idealised reference gait curve."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    _apply_dark_style(ax, fig)
+
+    fx = foot[:, 0] - foot[:, 0].mean()
+    fy = foot[:, 1] - foot[:, 1].min()
+
+    stride = np.ptp(fx);  height = np.ptp(fy)
+    rx, ry = _reference_gait_curve(stride, height)
+    ry     = ry - ry.min()
+
+    ax.plot(fx, fy, color=FOOT_COLOR,  lw=2.8, label='Simulated (Jansen)')
+    ax.plot(rx, ry, '--', color='#FF6600', lw=2.2, label='Reference gait curve')
+
+    ax.set_aspect('equal')
+    ax.set_xlabel('X (mm, centred)',   fontsize=12)
+    ax.set_ylabel('Y (mm, ground = 0)', fontsize=12)
+    ax.set_title('Simulated Jansen Trajectory  vs  Reference Gait Curve',
+                 fontsize=13)
+    leg = ax.legend(fontsize=11, facecolor='#1A1A1A',
+                    edgecolor=FG_COLOR, labelcolor=FG_COLOR)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=140, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  saved: {save_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — LINK VARIATION (parameter sweep)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def sweep_parameter(param_name, values, n_samples=360):
+    """Re-run kinematics for each value of one link length."""
+    results = []
+    for v in values:
+        links = copy.deepcopy(DEFAULT_LINKS)
+        links[param_name] = v
+        _, foot, _ = simulate_cycle(n_samples=n_samples, links=links)
+        valid = ~np.isnan(foot[:, 0])
+        results.append((v, foot[valid]))
+    return results
+
+
+def plot_sweep(param_name, results, save_path):
+    """Overlay foot trajectories for each sweep value (dark background)."""
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    _apply_dark_style(ax, fig)
+
+    # Use a vivid colormap that pops on dark background
+    palette = [
+        '#FF4444', '#FFD700', '#39FF14',
+        '#00CFFF', '#FF6EC7'
+    ]
+
+    summary = []
+    for idx, ((val, foot), color) in enumerate(zip(results, palette)):
+        if len(foot) == 0:
+            summary.append(f'  {param_name}={val:.1f}: assembly failed')
+            continue
+        ax.plot(foot[:, 0], foot[:, 1], '-', color=color, lw=2.4,
+                label=f'{param_name} = {val:.1f}')
+        stride = np.ptp(foot[:, 0]);  height = np.ptp(foot[:, 1])
+        summary.append(
+            f'  {param_name}={val:.1f}: stride={stride:.1f} mm, '
+            f'step={height:.1f} mm')
+
+    ax.set_aspect('equal')
+    ax.set_xlabel('X (mm)', fontsize=12)
+    ax.set_ylabel('Y (mm)', fontsize=12)
+    nominal = DEFAULT_LINKS[param_name]
+    ax.set_title(
+        f'Effect of varying  "{param_name}"  on the gait trajectory  '
+        f'(nominal = {nominal:.1f})',
+        fontsize=13)
+    leg = ax.legend(loc='upper right', fontsize=9,
+                    facecolor='#1A1A1A', edgecolor=FG_COLOR,
+                    labelcolor=FG_COLOR)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=140, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  saved: {save_path}")
+    for line in summary:
+        print(line)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — LEGEND FIGURE (link colours reference)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_link_legend(save_path):
+    """Small figure showing the colour assigned to each link."""
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.axis('off')
+    ax.set_title('Link Colour Legend', color=FG_COLOR, fontsize=12, pad=8)
+
+    n = len(LINK_EDGES)
+    for idx, (_, _, colour, label) in enumerate(LINK_EDGES):
+        y = 0.93 - idx * (0.88 / n)
+        ax.plot([0.05, 0.22], [y, y], '-', color=colour, lw=5,
+                solid_capstyle='round')
+        ax.text(0.27, y, label, color=FG_COLOR, va='center', fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=130, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  saved: {save_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print("=" * 68)
+    print("  Theo Jansen Walking Mechanism — Complete Simulation")
+    print("  IE410: Introduction to Robotics")
+    print("=" * 68)
+    print(f"\nUsing Jansen's holy numbers  (scale × {SCALE}):")
+    for k, v in DEFAULT_LINKS.items():
+        print(f"   {k:1s} = {v:5.1f}  →  {v * SCALE:7.2f} mm")
+    print()
+
+    # ── Step 1: Kinematics ──────────────────────────────────────────────────
+    print("─" * 50)
+    print("[1/5]  Solving kinematics (360 crank angles) …")
+    thetas, foot, poses = simulate_cycle(n_samples=360)
+    valid = ~np.isnan(foot[:, 0])
+    print(f"       Solved {valid.sum()} / {len(thetas)} poses successfully.")
+    stride = np.ptp(foot[valid, 0]);  height = np.ptp(foot[valid, 1])
+    print(f"       Stride length (X-span) : {stride:.1f} mm")
+    print(f"       Step height   (Y-span)  : {height:.1f} mm")
+    print(f"       Stride / step ratio     : {stride / height:.2f}")
+
+    # ── Step 2: Foot trajectory plot ────────────────────────────────────────
+    print("\n─" * 50)
+    print("[2/5]  Plotting foot trajectory …")
+    plot_foot_trajectory(
+        foot[valid],
+        os.path.join(OUT_DIR, 'foot_trajectory.png'))
+
+    # ── Step 3: Animation ───────────────────────────────────────────────────
+    print("\n─" * 50)
+    print("[3/5]  Rendering mechanism animation …")
+    make_animation(
+        thetas, poses, foot,
+        os.path.join(OUT_DIR, 'mechanism_animation.gif'),
+        n_frames=90)
+
+    # ── Step 4: Gait comparison ─────────────────────────────────────────────
+    print("\n─" * 50)
+    print("[4/5]  Plotting gait comparison …")
+    plot_gait_comparison(
+        foot[valid],
+        os.path.join(OUT_DIR, 'gait_comparison.png'))
+
+    # ── Step 5: Link variation ──────────────────────────────────────────────
+    print("\n─" * 50)
+    print("[5/5]  Parameter sweep: varying m (crank length) …")
+    res_m = sweep_parameter('m', [12.0, 13.5, 15.0, 16.5, 18.0])
+    plot_sweep('m', res_m, os.path.join(OUT_DIR, 'link_variation_m.png'))
+
+    print()
+    print("        Parameter sweep: varying h (long connector) …")
+    res_h = sweep_parameter('h', [62.0, 64.0, 65.7, 67.5, 69.5])
+    plot_sweep('h', res_h, os.path.join(OUT_DIR, 'link_variation_h.png'))
+
+    # ── Bonus: colour legend ────────────────────────────────────────────────
+    print("\n─" * 50)
+    print("[+]    Generating link colour legend …")
+    plot_link_legend(os.path.join(OUT_DIR, 'link_colour_legend.png'))
+
+    print("\n" + "=" * 68)
+    print("  All outputs saved to:", OUT_DIR)
+    print("=" * 68)
+
+
+if __name__ == '__main__':
+    main()
